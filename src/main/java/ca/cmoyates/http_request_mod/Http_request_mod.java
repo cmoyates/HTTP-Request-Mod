@@ -1,0 +1,31 @@
+package ca.cmoyates.http_request_mod;
+
+import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.minecraft.text.Text;
+import net.minecraft.util.Formatting;
+
+import static net.minecraft.server.command.CommandManager.literal;
+
+public class Http_request_mod implements ModInitializer {
+
+    @Override
+    public void onInitialize() {
+        System.out.println("Initializing");
+
+        CommandRegistrationCallback.EVENT.register(
+                ((commandDispatcher, commandRegistryAccess, registrationEnvironment) -> {
+                    commandDispatcher.register(
+
+
+                                literal("hello").executes(commandContext -> {
+                                    commandContext.getSource().sendMessage(Text.literal("Hi").formatted(Formatting.AQUA));
+
+                                    return 1;
+                                })
+
+                    );
+                })
+        );
+    }
+}

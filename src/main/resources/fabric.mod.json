@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "http_request_mod",
+  "version": "${version}",
+  "name": "HTTP Request Mod",
+  "description": "",
+  "authors": [],
+  "contact": {},
+  "license": "All-Rights-Reserved",
+  "icon": "assets/http_request_mod/icon.png",
+  "environment": "server",
+  "entrypoints": {
+    "fabric-datagen": [
+      "ca.cmoyates.http_request_mod.client.Http_request_modDataGenerator"
+    ],
+    "main": [
+      "ca.cmoyates.http_request_mod.Http_request_mod"
+    ]
+  },
+  "mixins": [
+    "http_request_mod.mixins.json",
+    {
+      "config": "http_request_mod.client.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "fabric-api": "*",
+    "minecraft": "${minecraft_version}"
+  }
+}
