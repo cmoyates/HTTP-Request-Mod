@@ -8,7 +8,7 @@
   "contact": {},
   "license": "All-Rights-Reserved",
   "icon": "assets/http_request_mod/icon.png",
-  "environment": "server",
+  "environment": "*",
   "entrypoints": {
     "fabric-datagen": [
       "ca.cmoyates.http_request_mod.client.Http_request_modDataGenerator"
