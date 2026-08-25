@@ -2,6 +2,15 @@
 
 A server-side Fabric mod for making HTTP requests and forwarding Minecraft chat messages to a WebSocket endpoint.
 
+## Installation
+
+1. Install [Fabric Loader](https://fabricmc.net/use/server/) for Minecraft 1.21.10.
+2. Install the [Fabric API](https://modrinth.com/mod/fabric-api).
+3. Download the mod JAR from the [latest GitHub release](https://github.com/cmoyates/HTTP-Request-Mod-Rebuild/releases/latest).
+4. Place the mod JAR and Fabric API JAR in the server's `mods` directory.
+
+The mod only needs to be installed on the server.
+
 ## WebSocket chat forwarding
 
 WebSocket commands can be run from the server console or by a player with operator permission (permission level 2 or higher).
