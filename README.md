@@ -6,7 +6,7 @@ A server-side Fabric mod for making HTTP requests and forwarding Minecraft chat 
 
 1. Install [Fabric Loader](https://fabricmc.net/use/server/) for Minecraft 1.21.10.
 2. Install the [Fabric API](https://modrinth.com/mod/fabric-api).
-3. Download the mod JAR from the [latest GitHub release](https://github.com/cmoyates/HTTP-Request-Mod-Rebuild/releases/latest).
+3. Download the mod JAR from the [latest GitHub release](https://github.com/cmoyates/http_request_mod/releases/latest).
 4. Place the mod JAR and Fabric API JAR in the server's `mods` directory.
 
 The mod only needs to be installed on the server.
