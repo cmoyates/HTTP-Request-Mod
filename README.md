@@ -47,3 +47,20 @@ This reports whether the mod is connected, connecting, or disconnected, along wi
 ```
 
 The connection is also closed automatically when the server stops. Connections are not restored automatically after a server restart.
+
+## Publishing a release
+
+Maintainers can publish a release from the repository's **Actions** tab:
+
+1. Select the **Publish release** workflow.
+2. Choose **Run workflow**.
+3. Select a semantic version bump: `patch`, `minor`, or `major`.
+4. Run the workflow from `main`.
+
+The workflow updates `mod_version`, builds and tests the mod with Java 21, commits the version change, creates a matching `vX.Y.Z` tag, and publishes the mod JAR and its SHA-256 checksum to a GitHub release.
+
+The same workflow can be started with the GitHub CLI:
+
+```shell
+gh workflow run publish-release.yml --ref main -f version_bump=patch
+```
