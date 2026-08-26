@@ -1,66 +1,74 @@
 package ca.cmoyates.http_request_mod.commands;
 
+import ca.cmoyates.http_request_mod.config.WebSocketConfigStore;
+import ca.cmoyates.http_request_mod.config.WebSocketSettings;
+import ca.cmoyates.http_request_mod.websocket.EndpointPolicy;
+import ca.cmoyates.http_request_mod.websocket.PiWebSocketClient;
 import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.arguments.BoolArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
-import net.fabricmc.fabric.api.message.v1.ServerMessageEvents;
-import net.minecraft.server.MinecraftServer;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.server.command.ServerCommandSource;
+import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.WebSocket;
-import java.time.Duration;
-import java.util.Locale;
-import java.util.Set;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
-import java.util.concurrent.TimeUnit;
 
 import static net.minecraft.server.command.CommandManager.argument;
 import static net.minecraft.server.command.CommandManager.literal;
 
+/** Registers the administrative WebSocket commands and the explicit /pi prompt command. */
 public final class WebSocketCommand {
     private static final Logger LOGGER = LoggerFactory.getLogger("http_request_mod/websocket");
-    private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
-    private static final Set<String> WEB_SOCKET_SCHEMES = Set.of("ws", "wss");
-    private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
-            .connectTimeout(CONNECT_TIMEOUT)
-            .version(HttpClient.Version.HTTP_1_1)
-            .build();
-    private static final Object CONNECTION_LOCK = new Object();
-
-    private static WebSocket connection;
-    private static URI connectedEndpoint;
-    private static URI connectingEndpoint;
-    private static CompletableFuture<WebSocket> connectionFuture;
-    private static CompletableFuture<Void> sendChain = CompletableFuture.completedFuture(null);
-    private static long connectionGeneration;
+    private static final WebSocketConfigStore CONFIG = new WebSocketConfigStore(
+            FabricLoader.getInstance().getConfigDir().resolve("http-request-mod.json")
+    );
+    private static final PiWebSocketClient CLIENT = new PiWebSocketClient(CONFIG);
+    private static boolean registered;
 
     private WebSocketCommand() {}
 
-    public static void register() {
+    public static synchronized void register() {
+        if (registered) {
+            return;
+        }
+        registered = true;
+
+        try {
+            WebSocketSettings settings = CONFIG.reload();
+            if (!settings.endpoint().isBlank()) {
+                EndpointPolicy.validate(settings.endpoint(), settings);
+            }
+        } catch (IOException | IllegalArgumentException exception) {
+            // Deliberately omit exception details because malformed configuration can contain a token.
+            CONFIG.restore(WebSocketSettings.defaults());
+            LOGGER.warn("Could not load a valid policy-compliant configuration from {}; safe defaults will be used", CONFIG.path());
+        }
+
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
                 registerCommands(dispatcher));
-
-        ServerMessageEvents.CHAT_MESSAGE.register((message, sender, params) ->
-                sendChatMessage(message.getContent().getString()));
-
-        ServerLifecycleEvents.SERVER_STOPPING.register(server -> disconnect(false));
+        ServerLifecycleEvents.SERVER_STARTED.register(CLIENT::onServerStarted);
+        ServerLifecycleEvents.SERVER_STOPPING.register(CLIENT::onServerStopping);
+        ServerTickEvents.END_SERVER_TICK.register(CLIENT::tick);
+        ServerPlayConnectionEvents.JOIN.register((handler, sender, server) ->
+                CLIENT.onPlayerJoin(handler.player));
     }
 
     private static void registerCommands(CommandDispatcher<ServerCommandSource> dispatcher) {
         dispatcher.register(
                 literal("websocket")
-                        // Connecting to an arbitrary network service is restricted to operators.
-                        .requires(source -> source.hasPermissionLevel(2))
+                        .requires(WebSocketCommand::canAdminister)
                         .then(literal("connect")
+                                .executes(ctx -> connectConfigured(ctx.getSource()))
                                 .then(argument("URL", StringArgumentType.greedyString())
-                                        .executes(ctx -> connect(
+                                        .executes(ctx -> selectAndConnect(
                                                 ctx.getSource(),
                                                 StringArgumentType.getString(ctx, "URL")
                                         ))
@@ -69,291 +77,217 @@ public final class WebSocketCommand {
                         .then(literal("disconnect")
                                 .executes(ctx -> disconnect(ctx.getSource()))
                         )
+                        .then(literal("endpoint")
+                                .executes(ctx -> showEndpoint(ctx.getSource()))
+                                .then(literal("clear")
+                                        .executes(ctx -> clearEndpoint(ctx.getSource()))
+                                )
+                                .then(argument("URL", StringArgumentType.greedyString())
+                                        .executes(ctx -> selectEndpoint(
+                                                ctx.getSource(),
+                                                StringArgumentType.getString(ctx, "URL")
+                                        ))
+                                )
+                        )
+                        .then(literal("autoconnect")
+                                .then(argument("enabled", BoolArgumentType.bool())
+                                        .executes(ctx -> setAutomaticConnect(
+                                                ctx.getSource(),
+                                                BoolArgumentType.getBool(ctx, "enabled")
+                                        ))
+                                )
+                        )
                         .then(literal("status")
                                 .executes(ctx -> status(ctx.getSource()))
+                        )
+                        .then(literal("reload")
+                                .executes(ctx -> reload(ctx.getSource()))
+                        )
+        );
+
+        dispatcher.register(
+                literal("pi")
+                        // The companion coding agent may execute commands and modify files.
+                        .requires(source -> source.isExecutedByPlayer() && canAdminister(source))
+                        .then(argument("prompt", StringArgumentType.greedyString())
+                                .executes(ctx -> sendPrompt(
+                                        ctx.getSource().getPlayerOrThrow(),
+                                        StringArgumentType.getString(ctx, "prompt")
+                                ))
                         )
         );
     }
 
-    private static int connect(ServerCommandSource source, String url) {
-        URI endpoint;
+    private static int connectConfigured(ServerCommandSource source) {
+        WebSocketSettings settings = CONFIG.get();
+        final URI endpoint;
         try {
-            endpoint = validateEndpoint(url);
+            endpoint = EndpointPolicy.validate(settings.endpoint(), settings);
         } catch (IllegalArgumentException exception) {
-            source.sendError(Text.literal("Invalid WebSocket URL: " + url + " (expected ws:// or wss://)"));
+            source.sendError(Text.literal("Cannot connect: " + exception.getMessage()));
             return -1;
         }
 
-        source.sendFeedback(() -> Text.literal("Connecting to " + endpoint + "..."), false);
-
-        WebSocket previousConnection = null;
-        CompletableFuture<WebSocket> previousFuture = null;
-        CompletableFuture<WebSocket> newFuture;
-        long generation = -1;
-
-        try {
-            synchronized (CONNECTION_LOCK) {
-                generation = ++connectionGeneration;
-                previousConnection = connection;
-                previousFuture = connectionFuture;
-
-                connection = null;
-                connectedEndpoint = null;
-                connectingEndpoint = endpoint;
-                sendChain = CompletableFuture.completedFuture(null);
-
-                newFuture = HTTP_CLIENT.newWebSocketBuilder()
-                        .connectTimeout(CONNECT_TIMEOUT)
-                        .buildAsync(endpoint, new SocketListener(generation));
-                newFuture.orTimeout(CONNECT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
-                connectionFuture = newFuture;
-            }
-        } catch (RuntimeException exception) {
-            synchronized (CONNECTION_LOCK) {
-                if (generation == connectionGeneration) {
-                    connectingEndpoint = null;
-                    connectionFuture = null;
-                }
-            }
-            closePreviousConnection(previousConnection, previousFuture);
-            source.sendError(Text.literal("Could not start WebSocket connection: " + errorMessage(exception)));
-            return -1;
-        }
-
-        closePreviousConnection(previousConnection, previousFuture);
-
-        MinecraftServer server = source.getServer();
-        long completedGeneration = generation;
-        newFuture.whenComplete((webSocket, throwable) -> {
-            boolean currentAttempt;
-            synchronized (CONNECTION_LOCK) {
-                currentAttempt = completedGeneration == connectionGeneration && connectionFuture == newFuture;
-
-                if (currentAttempt) {
-                    connectionFuture = null;
-                    connectingEndpoint = null;
-
-                    if (throwable == null && !webSocket.isInputClosed() && !webSocket.isOutputClosed()) {
-                        connection = webSocket;
-                        connectedEndpoint = endpoint;
-                    }
-                }
-            }
-
-            if (!currentAttempt) {
-                if (throwable == null) {
-                    webSocket.abort();
-                }
-                return;
-            }
-
-            server.execute(() -> {
-                if (throwable == null && !webSocket.isInputClosed() && !webSocket.isOutputClosed()) {
-                    source.sendFeedback(() -> Text.literal("Connected to " + endpoint), false);
-                } else if (throwable == null) {
-                    source.sendError(Text.literal("WebSocket connection to " + endpoint + " closed during setup"));
-                } else {
-                    source.sendError(Text.literal(
-                            "WebSocket connection to " + endpoint + " failed: " + errorMessage(throwable)
-                    ));
-                }
-            });
-        });
-
-        return 1;
-    }
-
-    private static int disconnect(ServerCommandSource source) {
-        URI endpoint;
-        boolean hadConnection;
-
-        synchronized (CONNECTION_LOCK) {
-            endpoint = connectedEndpoint != null ? connectedEndpoint : connectingEndpoint;
-            hadConnection = connection != null || connectionFuture != null;
-        }
-
-        if (!hadConnection) {
-            source.sendFeedback(() -> Text.literal("No WebSocket is connected"), false);
-            return 0;
-        }
-
-        disconnect(true);
+        CLIENT.connect(endpoint);
         source.sendFeedback(
-                () -> Text.literal(endpoint == null
-                        ? "Disconnected from WebSocket"
-                        : "Disconnected from " + endpoint),
+                () -> Text.literal("Starting pi WebSocket connection to " + displayEndpoint(endpoint)),
                 false
         );
         return 1;
     }
 
+    private static int selectAndConnect(ServerCommandSource source, String value) {
+        int selected = selectEndpoint(source, value);
+        return selected < 0 ? selected : connectConfigured(source);
+    }
+
+    private static int selectEndpoint(ServerCommandSource source, String value) {
+        WebSocketSettings current = CONFIG.get();
+        final URI endpoint;
+        try {
+            endpoint = EndpointPolicy.validate(value, current);
+        } catch (IllegalArgumentException exception) {
+            source.sendError(Text.literal("Invalid WebSocket endpoint: " + exception.getMessage()));
+            return -1;
+        }
+
+        try {
+            CONFIG.save(current.withEndpoint(endpoint.toString()));
+        } catch (IOException exception) {
+            LOGGER.warn("Could not persist the pi WebSocket endpoint");
+            source.sendError(Text.literal("Could not save the WebSocket configuration; see the server log."));
+            return -1;
+        }
+
+        source.sendFeedback(
+                () -> Text.literal("Saved pi WebSocket endpoint " + displayEndpoint(endpoint)),
+                false
+        );
+        return 1;
+    }
+
+    private static int clearEndpoint(ServerCommandSource source) {
+        try {
+            CONFIG.save(CONFIG.get().withEndpoint(""));
+        } catch (IOException exception) {
+            LOGGER.warn("Could not clear the pi WebSocket endpoint");
+            source.sendError(Text.literal("Could not save the WebSocket configuration; see the server log."));
+            return -1;
+        }
+        source.sendFeedback(() -> Text.literal("Cleared the configured pi WebSocket endpoint"), false);
+        return 1;
+    }
+
+    private static int showEndpoint(ServerCommandSource source) {
+        String configured = CONFIG.get().endpoint();
+        if (configured.isBlank()) {
+            source.sendFeedback(() -> Text.literal("No pi WebSocket endpoint is configured"), false);
+            return 0;
+        }
+        try {
+            URI endpoint = URI.create(configured);
+            source.sendFeedback(
+                    () -> Text.literal("Configured pi WebSocket endpoint: " + displayEndpoint(endpoint)),
+                    false
+            );
+        } catch (IllegalArgumentException exception) {
+            source.sendError(Text.literal("The configured pi WebSocket endpoint is invalid"));
+            return -1;
+        }
+        return 1;
+    }
+
+    private static int setAutomaticConnect(ServerCommandSource source, boolean enabled) {
+        try {
+            CONFIG.save(CONFIG.get().withAutomaticConnect(enabled));
+        } catch (IOException exception) {
+            LOGGER.warn("Could not persist the pi WebSocket automatic-connect setting");
+            source.sendError(Text.literal("Could not save the WebSocket configuration; see the server log."));
+            return -1;
+        }
+        source.sendFeedback(
+                () -> Text.literal("Automatic pi WebSocket connection " + (enabled ? "enabled" : "disabled")),
+                false
+        );
+        return 1;
+    }
+
+    private static int disconnect(ServerCommandSource source) {
+        boolean disconnected = CLIENT.disconnect();
+        source.sendFeedback(
+                () -> Text.literal(disconnected
+                        ? "Disconnected the pi WebSocket; reconnection is paused until a manual connect or world restart"
+                        : "Pi WebSocket is already disconnected"),
+                false
+        );
+        return disconnected ? 1 : 0;
+    }
+
     private static int status(ServerCommandSource source) {
-        URI activeEndpoint;
-        URI pendingEndpoint;
-
-        synchronized (CONNECTION_LOCK) {
-            activeEndpoint = connection == null ? null : connectedEndpoint;
-            pendingEndpoint = connectionFuture == null ? null : connectingEndpoint;
-        }
-
-        if (activeEndpoint != null) {
-            source.sendFeedback(() -> Text.literal("WebSocket connected to " + activeEndpoint), false);
-        } else if (pendingEndpoint != null) {
-            source.sendFeedback(() -> Text.literal("WebSocket connecting to " + pendingEndpoint), false);
-        } else {
-            source.sendFeedback(() -> Text.literal("WebSocket disconnected"), false);
-        }
-
-        return activeEndpoint != null ? 1 : 0;
+        PiWebSocketClient.ConnectionStatus connection = CLIENT.status();
+        WebSocketSettings settings = CONFIG.get();
+        String endpoint = connection.endpointDescription();
+        source.sendFeedback(
+                () -> Text.literal(
+                        "Pi WebSocket: " + connection.state().name().toLowerCase()
+                                + "; endpoint=" + endpoint
+                                + "; autoconnect=" + settings.automaticConnect()
+                                + "; authentication=" + (settings.hasSharedToken() ? "configured" : "not configured")
+                                + (connection.reconnectAttempt() > 0
+                                ? "; reconnect attempt=" + connection.reconnectAttempt()
+                                : "")
+                                + (connection.lastError() == null
+                                ? ""
+                                : "; last error=" + connection.lastError())
+                ),
+                false
+        );
+        return connection.state() == PiWebSocketClient.State.CONNECTED ? 1 : 0;
     }
 
-    private static void sendChatMessage(String message) {
-        WebSocket target;
-        CompletableFuture<Void> send;
-        long generation;
-
-        synchronized (CONNECTION_LOCK) {
-            target = connection;
-            generation = connectionGeneration;
-
-            if (target == null || target.isOutputClosed()) {
-                return;
+    private static int reload(ServerCommandSource source) {
+        WebSocketSettings previousSettings = CONFIG.get();
+        try {
+            WebSocketSettings settings = CONFIG.reload();
+            // Validate without displaying the value; reload itself does not change the active connection.
+            if (!settings.endpoint().isBlank()) {
+                EndpointPolicy.validate(settings.endpoint(), settings);
             }
-
-            // WebSocket only permits one outstanding text send. Chaining also preserves chat order.
-            send = sendChain
-                    .handle((ignored, throwable) -> null)
-                    .thenCompose(ignored -> target.sendText(message, true).thenApply(webSocket -> null));
-            sendChain = send;
-        }
-
-        send.whenComplete((ignored, throwable) -> {
-            if (throwable != null) {
-                LOGGER.warn("Failed to send a chat message through the WebSocket", throwable);
-                handleClosedConnection(target, generation);
-            }
-        });
-    }
-
-    private static void closePreviousConnection(
-            WebSocket previousConnection,
-            CompletableFuture<WebSocket> previousFuture
-    ) {
-        if (previousFuture != null) {
-            previousFuture.cancel(true);
-        }
-        if (previousConnection != null) {
-            previousConnection.sendClose(WebSocket.NORMAL_CLOSURE, "Replaced by a new connection")
-                    .exceptionally(throwable -> {
-                        previousConnection.abort();
-                        return previousConnection;
-                    });
+            source.sendFeedback(
+                    () -> Text.literal("Reloaded pi WebSocket configuration; reconnect to apply connection changes"),
+                    false
+            );
+            return 1;
+        } catch (IOException exception) {
+            CONFIG.restore(previousSettings);
+            LOGGER.warn("Could not reload the pi WebSocket configuration");
+            source.sendError(Text.literal("Could not reload the WebSocket configuration; existing settings remain active."));
+            return -1;
+        } catch (IllegalArgumentException exception) {
+            CONFIG.restore(previousSettings);
+            LOGGER.warn("Reloaded pi WebSocket configuration contains an invalid endpoint");
+            source.sendError(Text.literal(
+                    "Configuration endpoint is invalid; existing settings remain active: " + exception.getMessage()
+            ));
+            return -1;
         }
     }
 
-    private static void disconnect(boolean graceful) {
-        WebSocket oldConnection;
-        CompletableFuture<WebSocket> oldFuture;
-
-        synchronized (CONNECTION_LOCK) {
-            ++connectionGeneration;
-            oldConnection = connection;
-            oldFuture = connectionFuture;
-            connection = null;
-            connectedEndpoint = null;
-            connectingEndpoint = null;
-            connectionFuture = null;
-            sendChain = CompletableFuture.completedFuture(null);
+    private static boolean canAdminister(ServerCommandSource source) {
+        if (source.hasPermissionLevel(2)) {
+            return true;
         }
-
-        if (oldFuture != null) {
-            oldFuture.cancel(true);
-        }
-        if (oldConnection != null) {
-            if (graceful) {
-                oldConnection.sendClose(WebSocket.NORMAL_CLOSURE, "Disconnected by server")
-                        .exceptionally(throwable -> {
-                            oldConnection.abort();
-                            return oldConnection;
-                        });
-            } else {
-                oldConnection.abort();
-            }
-        }
+        ServerPlayerEntity player = source.getPlayer();
+        return player != null
+                && !source.getServer().isDedicated()
+                && source.getServer().isHost(player.getPlayerConfigEntry());
     }
 
-    private static void handleClosedConnection(WebSocket webSocket, long generation) {
-        synchronized (CONNECTION_LOCK) {
-            if (generation != connectionGeneration) {
-                return;
-            }
-
-            // During setup, the connection future owns the state and reports the failure to
-            // the command source. Only clear a socket that was fully installed as active here.
-            if (connection == webSocket) {
-                ++connectionGeneration;
-                connection = null;
-                connectedEndpoint = null;
-                connectingEndpoint = null;
-                connectionFuture = null;
-                sendChain = CompletableFuture.completedFuture(null);
-            }
-        }
+    private static String displayEndpoint(URI endpoint) {
+        return EndpointPolicy.display(endpoint, CONFIG.get().sharedToken());
     }
 
-    private static URI validateEndpoint(String url) {
-        URI endpoint = URI.create(url);
-        String scheme = endpoint.getScheme();
-
-        if (scheme == null
-                || !WEB_SOCKET_SCHEMES.contains(scheme.toLowerCase(Locale.ROOT))
-                || endpoint.getHost() == null) {
-            throw new IllegalArgumentException("URL must be an absolute WebSocket URL");
-        }
-
-        return endpoint;
-    }
-
-    private static String errorMessage(Throwable throwable) {
-        Throwable cause = throwable;
-        while (cause.getCause() != null) {
-            cause = cause.getCause();
-        }
-
-        String message = cause.getMessage();
-        return message == null || message.isBlank() ? cause.getClass().getSimpleName() : message;
-    }
-
-    private static final class SocketListener implements WebSocket.Listener {
-        private final long generation;
-
-        private SocketListener(long generation) {
-            this.generation = generation;
-        }
-
-        @Override
-        public void onOpen(WebSocket webSocket) {
-            webSocket.request(1);
-        }
-
-        @Override
-        public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
-            // Incoming data is intentionally ignored; keep requesting frames so the connection stays usable.
-            webSocket.request(1);
-            return null;
-        }
-
-        @Override
-        public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
-            LOGGER.info("WebSocket closed (status {}): {}", statusCode, reason);
-            handleClosedConnection(webSocket, generation);
-            return null;
-        }
-
-        @Override
-        public void onError(WebSocket webSocket, Throwable error) {
-            LOGGER.warn("WebSocket connection failed", error);
-            handleClosedConnection(webSocket, generation);
-        }
+    private static int sendPrompt(ServerPlayerEntity player, String prompt) {
+        return CLIENT.sendPrompt(player, prompt);
     }
 }
